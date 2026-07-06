@@ -1,18 +1,24 @@
 # FPCY VLESS Proxy Gateway
 
-Small HTTP gateway for the Worker `PROXY_GATEWAY_BASE_URL` integration. It exposes `/health` and `/fetch`, then forwards HTTPS upstream requests through one VLESS over WebSocket node.
+Small HTTP gateway for the Worker `PROXY_GATEWAY_BASE_URL` integration. It exposes `/health` and `/fetch`, then forwards HTTPS upstream requests through a VLESS node pool.
 
 Required environment variables:
 
-- `VLESS_URL`: the full `vless://...` node URL.
+- `PROXY_URLS`: one or more proxy URLs separated by newlines. Supported nodes are `vless://` with `security=none` and `type=tcp` or `type=ws`.
+- `VLESS_URL` / `VLESS_URLS`: fallback names for compatibility.
 - `GATEWAY_AUTH`: optional `user:password` value used by Worker `PROXY_GATEWAY_AUTH`.
 - `PORT`: optional, defaults to `8788`.
+
+`security=reality` and `vmess://` nodes are detected and reported by `/health`, but skipped by this native Node gateway.
 
 Run locally:
 
 ```powershell
 cd proxy-gateway
-$env:VLESS_URL = "vless://..."
+$env:PROXY_URLS = @"
+vless://...
+vless://...
+"@
 $env:GATEWAY_AUTH = "user:password"
 npm start
 ```

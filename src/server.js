@@ -1,14 +1,21 @@
 import http from 'node:http';
-import { parseVlessUrl, requestViaVless } from './vless.js';
+import { parseProxyPool, requestViaVless } from './vless.js';
 
 const port = Number(process.env.PORT || 8788);
 const auth = String(process.env.GATEWAY_AUTH || '').trim();
-const vlessConfig = parseVlessUrl(process.env.VLESS_URL);
+const proxyPool = parseProxyPool(process.env.PROXY_URLS || process.env.VLESS_URLS || process.env.VLESS_URL);
+let nextProxyIndex = 0;
 
 const server = http.createServer(async (request, response) => {
   try {
     if (request.url === '/health') {
-      return json(response, 200, { ok: true, pool_count: 1, proxy: vlessConfig.label });
+      return json(response, 200, {
+        ok: true,
+        pool_count: proxyPool.supported.length,
+        unsupported_count: proxyPool.unsupported.length,
+        proxies: proxyPool.supported.map(proxy => proxy.label),
+        unsupported: proxyPool.unsupported
+      });
     }
 
     const url = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`);
@@ -23,13 +30,17 @@ const server = http.createServer(async (request, response) => {
     const retries = Math.max(1, Number.parseInt(url.searchParams.get('retries') || '1', 10));
 
     let lastError;
+    const attempted = [];
     for (let attempt = 1; attempt <= retries; attempt++) {
+      const proxy = pickProxy();
+      attempted.push(proxy.label);
       try {
-        const upstream = await requestViaVless(vlessConfig, { url: targetUrl, method, headers, body, timeoutMs });
+        const upstream = await requestViaVless(proxy, { url: targetUrl, method, headers, body, timeoutMs });
         response.writeHead(upstream.status, {
           'Content-Type': upstream.headers['content-type'] || 'application/octet-stream',
           'X-Proxy-Used': upstream.proxy,
           'X-Attempts': String(attempt),
+          'X-Proxy-Attempted': attempted.join(','),
           'X-Elapsed-Ms': String(upstream.elapsedMs),
           'X-Final-URL': targetUrl,
           'X-Proxy-Bytes-Up': String(upstream.bytesUp),
@@ -45,7 +56,8 @@ const server = http.createServer(async (request, response) => {
     response.writeHead(502, {
       'Content-Type': 'text/plain; charset=utf-8',
       'X-Gateway-Error': '1',
-      'X-Proxy-Used': vlessConfig.label,
+      'X-Proxy-Used': attempted.at(-1) || '',
+      'X-Proxy-Attempted': attempted.join(','),
       'X-Attempts': String(retries)
     });
     response.end(lastError instanceof Error ? lastError.message : 'proxy gateway failed');
@@ -55,8 +67,14 @@ const server = http.createServer(async (request, response) => {
 });
 
 server.listen(port, () => {
-  console.log(`fpcy VLESS proxy gateway listening on ${port}`);
+  console.log(`fpcy VLESS proxy gateway listening on ${port} with ${proxyPool.supported.length} supported proxies`);
 });
+
+function pickProxy() {
+  const proxy = proxyPool.supported[nextProxyIndex % proxyPool.supported.length];
+  nextProxyIndex += 1;
+  return proxy;
+}
 
 function isAuthorized(request) {
   if (!auth) return true;

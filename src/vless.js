@@ -1,4 +1,5 @@
 import { Duplex } from 'node:stream';
+import net from 'node:net';
 import tls from 'node:tls';
 import { once } from 'node:events';
 
@@ -8,18 +9,45 @@ export function parseVlessUrl(raw) {
 
   const url = new URL(value);
   if (url.protocol !== 'vless:') throw new Error('VLESS_URL must start with vless://');
-  if ((url.searchParams.get('type') || '').toLowerCase() !== 'ws') throw new Error('only VLESS over WebSocket is supported');
+  const network = (url.searchParams.get('type') || 'tcp').toLowerCase();
+  if (!['tcp', 'ws'].includes(network)) throw new Error('only VLESS over TCP or WebSocket is supported');
   if ((url.searchParams.get('security') || 'none').toLowerCase() !== 'none') throw new Error('only security=none is supported');
   if ((url.searchParams.get('encryption') || 'none').toLowerCase() !== 'none') throw new Error('only encryption=none is supported');
 
-  return {
+  const config = {
     uuid: url.username,
-    host: url.hostname,
+    host: stripIpv6Brackets(url.hostname),
     port: Number(url.port || 80),
     path: url.searchParams.get('path') || '/',
-    label: `${url.hostname}:${url.port || 80}`,
-    wsUrl: `ws://${url.hostname}:${url.port || 80}${url.searchParams.get('path') || '/'}`
+    network,
+    label: `${stripIpv6Brackets(url.hostname)}:${url.port || 80}`
   };
+  if (network === 'ws') config.wsUrl = `ws://${url.host}${url.searchParams.get('path') || '/'}`;
+  return config;
+}
+
+export function parseProxyPool(raw) {
+  const entries = String(raw || '')
+    .split(/\r?\n|\s+(?=(?:vless|vmess):\/\/)/)
+    .map(value => value.trim())
+    .filter(Boolean);
+  const supported = [];
+  const unsupported = [];
+
+  for (const entry of entries) {
+    try {
+      if (!entry.toLowerCase().startsWith('vless://')) throw new Error('only vless:// nodes are supported');
+      supported.push(parseVlessUrl(entry));
+    } catch (error) {
+      unsupported.push({
+        label: safeProxyLabel(entry),
+        reason: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+
+  if (!supported.length) throw new Error('no supported proxy nodes configured');
+  return { supported, unsupported };
 }
 
 export async function requestViaVless(vlessConfig, request) {
@@ -50,6 +78,8 @@ export async function requestViaVless(vlessConfig, request) {
 }
 
 async function openVlessTunnel(vlessConfig, targetHost, targetPort, timeoutMs) {
+  if (vlessConfig.network === 'tcp') return openVlessTcpTunnel(vlessConfig, targetHost, targetPort, timeoutMs);
+
   const ws = new WebSocket(vlessConfig.wsUrl);
   ws.binaryType = 'arraybuffer';
   await new Promise((resolve, reject) => {
@@ -61,6 +91,22 @@ async function openVlessTunnel(vlessConfig, targetHost, targetPort, timeoutMs) {
     ws.addEventListener('error', reject, { once: true });
   });
   return new VlessWebSocketDuplex(ws, vlessConfig.uuid, targetHost, targetPort);
+}
+
+async function openVlessTcpTunnel(vlessConfig, targetHost, targetPort, timeoutMs) {
+  const socket = net.connect({ host: vlessConfig.host, port: vlessConfig.port });
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('VLESS TCP connect timeout')), timeoutMs);
+    socket.once('connect', () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    socket.once('error', error => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+  return new VlessTcpDuplex(socket, vlessConfig.uuid, targetHost, targetPort);
 }
 
 class VlessWebSocketDuplex extends Duplex {
@@ -106,6 +152,45 @@ class VlessWebSocketDuplex extends Duplex {
   }
 }
 
+class VlessTcpDuplex extends Duplex {
+  constructor(socket, uuid, targetHost, targetPort) {
+    super();
+    this.socket = socket;
+    this.header = buildVlessHeader(uuid, targetHost, targetPort);
+    this.sentHeader = false;
+    this.firstInbound = true;
+    this.bytesUp = 0;
+    this.bytesDown = 0;
+
+    socket.on('data', chunk => {
+      let payload = Buffer.from(chunk);
+      this.bytesDown += payload.byteLength;
+      if (this.firstInbound) {
+        this.firstInbound = false;
+        payload = payload.subarray(2 + (payload[1] || 0));
+      }
+      if (payload.byteLength > 0) this.push(payload);
+    });
+    socket.on('end', () => this.push(null));
+    socket.on('close', () => this.push(null));
+    socket.on('error', error => this.destroy(error));
+  }
+
+  _read() {}
+
+  _write(chunk, _encoding, callback) {
+    const payload = this.sentHeader ? Buffer.from(chunk) : Buffer.concat([this.header, Buffer.from(chunk)]);
+    this.sentHeader = true;
+    this.bytesUp += payload.byteLength;
+    this.socket.write(payload, callback);
+  }
+
+  _destroy(error, callback) {
+    this.socket.destroy();
+    callback(error);
+  }
+}
+
 function buildVlessHeader(uuid, targetHost, targetPort) {
   const hostBytes = Buffer.from(targetHost);
   return Buffer.concat([
@@ -120,6 +205,20 @@ function uuidToBytes(uuid) {
   const normalized = String(uuid || '').replace(/-/g, '');
   if (!/^[0-9a-fA-F]{32}$/.test(normalized)) throw new Error('invalid VLESS UUID');
   return Buffer.from(normalized, 'hex');
+}
+
+function stripIpv6Brackets(host) {
+  return String(host || '').replace(/^\[|\]$/g, '');
+}
+
+function safeProxyLabel(raw) {
+  try {
+    const url = new URL(raw);
+    if (url.protocol === 'vmess:') return 'vmess:unsupported';
+    return `${url.protocol.replace(':', '')}:${stripIpv6Brackets(url.hostname)}:${url.port || ''}`;
+  } catch {
+    return String(raw || '').slice(0, 32);
+  }
 }
 
 async function webSocketDataToBuffer(data) {
