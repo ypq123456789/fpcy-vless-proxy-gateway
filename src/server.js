@@ -8,7 +8,6 @@ const vlessConfig = parseVlessUrl(process.env.VLESS_URL);
 const server = http.createServer(async (request, response) => {
   try {
     if (request.url === '/health') {
-      if (!isAuthorized(request)) return unauthorized(response);
       return json(response, 200, { ok: true, pool_count: 1, proxy: vlessConfig.label });
     }
 
