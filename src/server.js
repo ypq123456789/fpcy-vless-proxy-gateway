@@ -1,21 +1,26 @@
 import http from 'node:http';
 import { parseProxyPool, requestViaVless } from './vless.js';
+import { createProxyPool } from './proxy-pool.js';
+import { fetchSubscriptionNodes, parseSubscriptionUrls } from './subscriptions.js';
 
 const port = Number(process.env.PORT || 8788);
 const auth = String(process.env.GATEWAY_AUTH || '').trim();
-const proxyPool = parseProxyPool(process.env.PROXY_URLS || process.env.VLESS_URLS || process.env.VLESS_URL);
-let nextProxyIndex = 0;
+const subscriptionUrls = parseSubscriptionUrls(process.env.SUBSCRIPTION_URLS || '');
+const refreshIntervalMs = Math.max(60_000, Number(process.env.SUBSCRIPTION_REFRESH_SECONDS || 600) * 1000);
+const healthIntervalMs = Math.max(30_000, Number(process.env.PROXY_HEALTH_SECONDS || 300) * 1000);
+const healthTargetUrl = process.env.PROXY_HEALTH_URL || 'https://api.ipify.org?format=json';
+const initialProxyText = process.env.PROXY_URLS || process.env.VLESS_URLS || process.env.VLESS_URL || '';
+const initialPool = parseProxyPool(initialProxyText || 'vless://00000000-0000-0000-0000-000000000000@127.0.0.1:1?encryption=none&security=none&type=tcp');
+const proxyPool = createProxyPool(initialPool);
+
+if (!initialProxyText && subscriptionUrls.length) {
+  proxyPool.replaceSupported({ supported: [], unsupported: [] });
+}
 
 const server = http.createServer(async (request, response) => {
   try {
     if (request.url === '/health') {
-      return json(response, 200, {
-        ok: true,
-        pool_count: proxyPool.supported.length,
-        unsupported_count: proxyPool.unsupported.length,
-        proxies: proxyPool.supported.map(proxy => proxy.label),
-        unsupported: proxyPool.unsupported
-      });
+      return json(response, 200, proxyPool.snapshot());
     }
 
     const url = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`);
@@ -32,7 +37,7 @@ const server = http.createServer(async (request, response) => {
     let lastError;
     const attempted = [];
     for (let attempt = 1; attempt <= retries; attempt++) {
-      const proxy = pickProxy();
+      const proxy = proxyPool.pickProxy();
       attempted.push(proxy.label);
       try {
         const upstream = await requestViaVless(proxy, { url: targetUrl, method, headers, body, timeoutMs });
@@ -67,14 +72,13 @@ const server = http.createServer(async (request, response) => {
 });
 
 server.listen(port, () => {
-  console.log(`fpcy VLESS proxy gateway listening on ${port} with ${proxyPool.supported.length} supported proxies`);
+  console.log(`fpcy VLESS proxy gateway listening on ${port}`);
 });
 
-function pickProxy() {
-  const proxy = proxyPool.supported[nextProxyIndex % proxyPool.supported.length];
-  nextProxyIndex += 1;
-  return proxy;
-}
+void refreshFromSubscriptions();
+void refreshProxyHealth();
+if (subscriptionUrls.length) setInterval(() => void refreshFromSubscriptions(), refreshIntervalMs).unref();
+setInterval(() => void refreshProxyHealth(), healthIntervalMs).unref();
 
 function isAuthorized(request) {
   if (!auth) return true;
@@ -99,5 +103,58 @@ function parseHeaders(raw) {
     return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
   } catch {
     return {};
+  }
+}
+
+async function refreshFromSubscriptions() {
+  if (!subscriptionUrls.length) return;
+  try {
+    const result = await fetchSubscriptionNodes(subscriptionUrls);
+    const rawPool = [...result.nodes, initialProxyText].filter(Boolean).join('\n');
+    const parsed = parseProxyPool(rawPool);
+    proxyPool.replaceSupported(parsed, result.failures);
+    console.log(`subscription refresh loaded ${parsed.supported.length} supported proxies and ${parsed.unsupported.length} unsupported proxies`);
+    await refreshProxyHealth();
+  } catch (error) {
+    console.error('subscription refresh failed', error instanceof Error ? error.message : error);
+  }
+}
+
+async function refreshProxyHealth() {
+  const supported = proxyPool.supported();
+  if (!supported.length) {
+    proxyPool.replaceActive([], []);
+    return;
+  }
+  const results = await Promise.all(supported.map(proxy => checkProxy(proxy)));
+  proxyPool.replaceActive(
+    results.filter(result => result.ok).map(result => result.proxy),
+    results.filter(result => !result.ok).map(result => ({
+      label: result.proxy.label,
+      reason: result.reason,
+      elapsedMs: result.elapsedMs
+    }))
+  );
+}
+
+async function checkProxy(proxy) {
+  const startedAt = Date.now();
+  try {
+    const result = await requestViaVless(proxy, {
+      url: healthTargetUrl,
+      method: 'GET',
+      headers: {},
+      body: '',
+      timeoutMs: Math.max(1000, Number(process.env.PROXY_HEALTH_TIMEOUT_SECONDS || 10) * 1000)
+    });
+    if (result.status >= 200 && result.status < 300) return { ok: true, proxy, elapsedMs: Date.now() - startedAt };
+    return { ok: false, proxy, elapsedMs: Date.now() - startedAt, reason: `HTTP ${result.status}` };
+  } catch (error) {
+    return {
+      ok: false,
+      proxy,
+      elapsedMs: Date.now() - startedAt,
+      reason: error instanceof Error ? error.message : String(error)
+    };
   }
 }
